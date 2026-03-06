@@ -7,7 +7,7 @@ A working demonstration of a LangGraph agent that:
 3. Serves a CopilotKit AG-UI endpoint so a React frontend can connect to any paused thread by `thread_id`, immediately see the agent state and pending approval request, and resolve it
 4. Calls back to Unity with the outcome after the human decides
 
-All behaviour is verified by 34 automated tests — no LLM calls, no real servers required.
+All behaviour is verified by 36 automated tests — no LLM calls, no real servers required.
 
 ---
 
@@ -69,7 +69,7 @@ tests/
   conftest.py       Shared fixtures (isolated graphs, ASGI clients)
   test_graph.py     16 tests – graph logic, interrupt, resume, webhook callback
   test_intake.py     5 tests – Unity intake HTTP endpoint
-  test_agui_sync.py  5 tests – AG-UI SSE stream and state-sync behaviour
+  test_agui_sync.py  7 tests – AG-UI SSE stream, state-sync, and completed-thread behaviour
   test_full_flow.py  8 tests – complete end-to-end sequence
 ```
 
@@ -80,7 +80,7 @@ tests/
 ```bash
 uv sync --extra dev
 uv run pytest -v
-# 34 passed
+# 36 passed
 ```
 
 ## Running the server
@@ -117,33 +117,65 @@ RUN_STARTED → on_interrupt (CUSTOM) → RUN_FINISHED
 
 This fires `useLangGraphInterrupt` immediately — the user sees the approval UI without any graph re-execution. **No polling required.**
 
-### 3. The fast-path gap in `ag_ui_langgraph` (and the fix)
+### 3. Two gaps in `ag_ui_langgraph` — and one fix for both
 
-The reconnect fast-path skips `STATE_SNAPSHOT` and `MESSAGES_SNAPSHOT`. The consequences without a fix:
+**`StateSyncAGUIAgent`** (`src/agent_server/agui_agent.py`) patches two related problems by subclassing `LangGraphAGUIAgent` and overriding `prepare_stream`.
 
-- `useCoAgent` state is **never populated** — you would have to manually duplicate all agent state fields inside the `interrupt()` payload just to render the UI
-- Message history is **not restored**
+#### Gap A — Interrupt reconnect missing state sync
 
-**`StateSyncAGUIAgent`** (`src/agent_server/agui_agent.py`) fixes this by subclassing `LangGraphAGUIAgent` and overriding `prepare_stream` to inject both events into the fast-path:
+The reconnect fast-path (active interrupt, no resume) only emits:
+
+```
+RUN_STARTED → on_interrupt → RUN_FINISHED
+```
+
+It skips `STATE_SNAPSHOT` and `MESSAGES_SNAPSHOT`. The consequence: `useCoAgent` state is **never populated** and message history is **not restored**.
+
+Fix: inject both events before `on_interrupt`:
 
 ```
 RUN_STARTED → STATE_SNAPSHOT → MESSAGES_SNAPSHOT → on_interrupt → RUN_FINISHED
 ```
 
-The `STATE_SNAPSHOT` contains the full checkpoint state (`case_id`, `case_summary`, `recommended_action`, `client_email`, `status`, …). The `MESSAGES_SNAPSHOT` carries the LangChain message history. Both are populated automatically on the frontend via `useCoAgent` and `CopilotChat` — no manual state duplication needed.
+#### Gap B — Completed thread triggers unintended graph re-run
 
-The fix is ~25 lines, purely additive, and requires no changes to the graph or the frontend:
+When a user opens the HITL UI for a case that has **already been resolved** (graph at END), the base library calls `graph.astream_events(input=state)`. LangGraph interprets this as a *new run from START*: `process_case` and `request_hitl_approval` re-execute, the completed case is overwritten with a fresh interrupt.
+
+Fix: detect `next == ()` with non-empty state and no resume command, then emit the final checkpointed state directly without touching the graph:
+
+```
+RUN_STARTED → STATE_SNAPSHOT → MESSAGES_SNAPSHOT → RUN_FINISHED
+```
+
+This lets auditors or supervisors open a completed case and see the final decision (`status: "complete"`, `hitl_decision: "approve"|"reject"`) without triggering any re-execution.
+
+#### Combined implementation (~45 lines, purely additive)
 
 ```python
 class StateSyncAGUIAgent(LangGraphAGUIAgent):
     async def prepare_stream(self, input, agent_state, config):
         result = await super().prepare_stream(input, agent_state, config)
-        if not result.get("events_to_dispatch"):   # only act on the fast-path
+
+        events_to_dispatch = result.get("events_to_dispatch")
+        if events_to_dispatch:
+            # Gap A: interrupt fast-path – inject state/messages snapshots
+            events_to_dispatch.insert(1, MessagesSnapshotEvent(...))
+            events_to_dispatch.insert(1, StateSnapshotEvent(...))
             return result
-        state_values = agent_state.values
-        events_to_dispatch = result["events_to_dispatch"]
-        events_to_dispatch.insert(1, StateSnapshotEvent(...))
-        events_to_dispatch.insert(1, MessagesSnapshotEvent(...))
+
+        # Gap B: completed thread – emit final state, skip graph re-run
+        forwarded_props = input.forwarded_props or {}
+        resume_input = forwarded_props.get("command", {}).get("resume", None)
+        if not resume_input and not agent_state.next and agent_state.values:
+            return {
+                "stream": None, "state": None, "config": None,
+                "events_to_dispatch": [
+                    StateSnapshotEvent(...),
+                    MessagesSnapshotEvent(...),
+                    RunFinishedEvent(...),
+                ],
+            }
+
         return result
 ```
 

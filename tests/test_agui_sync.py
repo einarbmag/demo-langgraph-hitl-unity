@@ -380,3 +380,194 @@ class TestAGUIStateSync:
         assert snapshot.next == ()
         assert snapshot.values["status"] == "complete"
         assert snapshot.values["hitl_decision"] == "approve"
+
+
+# ---------------------------------------------------------------------------
+# Completed-thread history viewing
+# ---------------------------------------------------------------------------
+
+class TestCompletedThread:
+    """
+    Verifies that a user can open the HITL UI for a case that has *already*
+    been resolved (graph at END, no pending interrupt) and see the final
+    state and history without triggering a new graph run.
+
+    Use-case: an auditor or supervisor opens a case after it was approved or
+    rejected to review the decision.
+    """
+
+    @pytest.mark.asyncio
+    async def test_connecting_to_completed_thread_shows_final_state(
+        self, patched_agent_client, respx_mock
+    ):
+        """
+        The HITL UI connects to a thread whose graph has already reached END.
+        StateSyncAGUIAgent must emit the final checkpointed state directly
+        (STATE_SNAPSHOT + MESSAGES_SNAPSHOT) instead of re-running the graph.
+
+        Without the fix:
+        - ag_ui_langgraph re-invokes graph.astream_events(input=state)
+        - LangGraph restarts the graph from START
+        - process_case + request_hitl_approval run again → new interrupt
+        - The completed case is overwritten with a fresh one
+
+        With the fix:
+        - STATE_SNAPSHOT shows status="complete" and the approve/reject decision
+        - RUN_FINISHED is emitted (no dangling stream)
+        - No on_interrupt CUSTOM event is present
+        """
+        client, graph = patched_agent_client
+        thread_id = str(uuid.uuid4())
+
+        # ── Step 1: Submit case → graph pauses at interrupt ──────────────────
+        await graph.ainvoke(
+            {
+                "case_id": "CASE-DONE-1",
+                "client_email": "done@billing.example.com",
+                "unity_webhook_url": "http://unity/webhook/case-update",
+                "messages": [],
+            },
+            config={"configurable": {"thread_id": thread_id}},
+        )
+
+        # ── Step 2: Approve → graph runs finalize_case → END ─────────────────
+        respx_mock.post("http://unity/webhook/case-update").respond(
+            200, json={"received": True}
+        )
+        from langgraph.types import Command
+        await graph.ainvoke(
+            Command(resume={"decision": "approve", "notes": "Looks clean"}),
+            config={"configurable": {"thread_id": thread_id}},
+        )
+
+        completed = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        assert completed.next == (), "Graph must be at END before testing reconnect"
+        assert completed.values["status"] == "complete"
+
+        # ── Step 3: HITL UI opens the completed case ──────────────────────────
+        async with client.stream(
+            "POST",
+            "/copilotkit",
+            json=agui_request(thread_id),
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            raw = await resp.aread()
+
+        events = parse_sse_events(raw.decode())
+        event_types = [
+            e.get("data", {}).get("type")
+            for e in events
+            if isinstance(e.get("data"), dict)
+        ]
+
+        # ── Lifecycle events ──────────────────────────────────────────────────
+        assert any("RUN_STARTED" in str(t) for t in event_types), (
+            f"Missing RUN_STARTED in {event_types}"
+        )
+        assert any("RUN_FINISHED" in str(t) for t in event_types), (
+            f"Missing RUN_FINISHED in {event_types}"
+        )
+
+        # ── STATE_SNAPSHOT must reflect the completed state ───────────────────
+        assert "STATE_SNAPSHOT" in event_types, (
+            "StateSyncAGUIAgent must emit STATE_SNAPSHOT for completed threads "
+            "so useCoAgent shows the final decision\n"
+            + str(event_types)
+        )
+
+        snapshot_event = next(
+            e for e in events
+            if isinstance(e.get("data"), dict)
+            and e["data"].get("type") == "STATE_SNAPSHOT"
+        )
+        snap = snapshot_event["data"].get("snapshot", {})
+        assert snap.get("status") == "complete", (
+            f"Expected status='complete' in STATE_SNAPSHOT, got: {snap.get('status')}"
+        )
+        assert snap.get("hitl_decision") == "approve", (
+            f"Expected hitl_decision='approve', got: {snap.get('hitl_decision')}"
+        )
+        assert snap.get("case_id") == "CASE-DONE-1"
+        assert "done@billing" in snap.get("case_summary", ""), (
+            "case_summary should contain the client email"
+        )
+
+        # ── MESSAGES_SNAPSHOT for history ─────────────────────────────────────
+        assert "MESSAGES_SNAPSHOT" in event_types, (
+            f"Missing MESSAGES_SNAPSHOT in {event_types}"
+        )
+
+        # ── No interrupt event – the graph is done ────────────────────────────
+        interrupt_events = [
+            e for e in events
+            if (
+                isinstance(e.get("data"), dict)
+                and e["data"].get("type") == "CUSTOM"
+                and "interrupt" in str(e["data"].get("name", "")).lower()
+            )
+        ]
+        assert len(interrupt_events) == 0, (
+            "Completed thread must NOT emit on_interrupt – "
+            "the case is already resolved\n"
+            + "\n".join(str(e) for e in events)
+        )
+
+    @pytest.mark.asyncio
+    async def test_completed_thread_does_not_restart_graph(
+        self, patched_agent_client, respx_mock
+    ):
+        """
+        Guard: the graph must NOT be re-invoked when connecting to a completed
+        thread.  After the HITL UI connects, the graph state should remain
+        unchanged (status still "complete", same hitl_decision).
+
+        This catches the regression where ag_ui_langgraph would restart the
+        graph from START, overwriting the completed case with a fresh run.
+        """
+        client, graph = patched_agent_client
+        thread_id = str(uuid.uuid4())
+
+        # Submit + approve
+        await graph.ainvoke(
+            {
+                "case_id": "CASE-DONE-2",
+                "client_email": "nochange@vip.example.com",
+                "unity_webhook_url": "http://unity/webhook/case-update",
+                "messages": [],
+            },
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        respx_mock.post("http://unity/webhook/case-update").respond(
+            200, json={"received": True}
+        )
+        from langgraph.types import Command
+        await graph.ainvoke(
+            Command(resume={"decision": "reject", "notes": "Declined"}),
+            config={"configurable": {"thread_id": thread_id}},
+        )
+
+        before = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        assert before.next == ()
+
+        # Open HITL UI (should only read, not mutate)
+        async with client.stream(
+            "POST",
+            "/copilotkit",
+            json=agui_request(thread_id),
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            await resp.aread()
+
+        after = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+
+        # Graph state must be identical before and after the UI connects
+        assert after.next == (), "Graph must still be at END after HITL UI connects"
+        assert after.values["status"] == "complete", (
+            "status must remain 'complete' – graph was re-run if this fails"
+        )
+        assert after.values["hitl_decision"] == "reject", (
+            "hitl_decision must remain 'reject' – graph was re-run if this fails"
+        )
+        assert after.values["case_id"] == "CASE-DONE-2", (
+            "case_id must not change – graph was re-run if this fails"
+        )
